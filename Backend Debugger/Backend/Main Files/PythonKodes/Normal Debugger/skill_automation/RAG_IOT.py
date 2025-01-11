@@ -2,13 +2,16 @@ import asyncio
 from langchain_community.chat_models import ChatOllama
 from .store import MemoryStore
 from .agent import HomeAgent
+import os
+import sys
+from dotenv import load_dotenv
+from pathlib import Path
+import importlib.util
 
 async def main():
     # Initialize components
     current_dir = Path(__file__).parent
     project_root = current_dir.parent
-            
-    # Load environment variables
     env_path = project_root / "API_KEYS.env"
     if not env_path.exists():
         raise FileNotFoundError(f"Environment file not found at {env_path}")
