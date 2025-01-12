@@ -5,8 +5,7 @@ import copy
 import json
 import logging
 from typing import Literal
-import os
-import sys
+
 from langchain_core.messages import (
     AnyMessage,
     BaseMessage,
@@ -20,8 +19,7 @@ from langchain_core.runnables import RunnableConfig  # noqa: TCH002
 from langgraph.store.base import BaseStore  # noqa: TCH002
 from langgraph.graph import END, START, MessagesState, StateGraph
 from pydantic import ValidationError
-from pathlib import Path
-import importlib.util
+
 from .const import (
     CONF_SUMMARIZATION_MODEL_TEMPERATURE,
     CONF_SUMMARIZATION_MODEL_TOP_P,
@@ -38,39 +36,37 @@ from .const import (
     TOOL_CALL_ERROR_TEMPLATE,
     VLM_NUM_PREDICT,
 )
-from dotenv import load_dotenv
-import time
-import random
-from tenacity import retry, stop_after_attempt, wait_exponential
 import asyncio
+from pathlib import Path
+import os
+import sys
+import importlib.util
+from dotenv import load_dotenv
 
 LOGGER = logging.getLogger(__name__)
 
 current_dir = Path(__file__).parent
 project_root = current_dir.parent
-        
-# Load environment variables
+    
 env_path = project_root / "API_KEYS.env"
 if not env_path.exists():
     raise FileNotFoundError(f"Environment file not found at {env_path}")
-        
+    
 load_dotenv(dotenv_path=str(env_path))
 wolfram_api_key = os.environ.get("WOLFRAM_ALPHA_API_KEY")
-        
+    
 if not wolfram_api_key:
     raise ValueError("WOLFRAM_ALPHA_API_KEY not found in environment variables")
-            
 base_data_path = project_root / "BASE_DATA.py"
 if not base_data_path.exists():
     raise FileNotFoundError(f"BASE_DATA.py not found at {base_data_path}")
-            
+    
 sys.path.insert(0, str(project_root))
-        
+    
 try:
     spec = importlib.util.spec_from_file_location("BASE_DATA", base_data_path)
     base_data = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(base_data)
-
 except Exception as e:
     raise ImportError(f"Failed to import BASE_DATA: {str(e)}")
 
@@ -79,70 +75,53 @@ class State(MessagesState):
 
     summary: str
 
-# Add retry decorator for model calls
-@retry(
-    wait=wait_exponential(multiplier=1, min=4, max=60),
-    stop=stop_after_attempt(3)
-)
 async def _call_model(
         state: State, config: RunnableConfig, *, store: BaseStore
     ) -> dict[str, list[BaseMessage]]:
-    """Coroutine to call the model with retry logic."""
-    try:
-        # Add small random delay to avoid burst requests
-        await asyncio.sleep(random.uniform(0.5, 2))
-        
-        model = config["configurable"]["chat_model"]
-        prompt = config["configurable"]["prompt"]
-        user_id = config["configurable"]["user_id"]
+    """Coroutine to call the model."""
+    model = config["configurable"]["chat_model"]
+    prompt = config["configurable"]["prompt"]
+    user_id = config["configurable"]["user_id"]
 
-        # Initialize empty memories message
-        mems_message = ""
-        
-        # Only attempt to retrieve memories if store is available
-        if store is not None:
-            # Retrieve most recent or search for most relevant memories for context.
-            # Use semantic search if the last message was from the user.
+    # Initialize empty memories message
+    mems_message = ""
+    
+    # Only attempt to retrieve memories if store is available
+    if store is not None:
+        try:
             msg = state["messages"][-1]
             query_prompt = EMBEDDING_MODEL_PROMPT_TEMPLATE.format(
                 query=msg.content
             ) if isinstance(msg, HumanMessage) else None
             
-            try:
-                mems = await store.asearch(
-                    (user_id, "memories"),
-                    query=query_prompt,
-                    limit=10
-                )
-                formatted_mems = "\n".join(f"[{mem.key}]: {mem.value}" for mem in mems)
-                mems_message = f"\n<memories>\n{formatted_mems}\n</memories>" if formatted_mems else ""
-            except Exception as e:
-                LOGGER.warning("Failed to retrieve memories: %s", str(e))
+            mems = await store.asearch(
+                (user_id, "memories"),
+                query=query_prompt,
+                limit=10
+            )
+            formatted_mems = "\n".join(f"[{mem.key}]: {mem.value}" for mem in mems)
+            mems_message = f"\n<memories>\n{formatted_mems}\n</memories>" if formatted_mems else ""
+        except Exception as e:
+            LOGGER.warning("Failed to retrieve memories: %s", str(e))
 
-        # Rest of the function remains the same
-        summary = state.get("summary", "")
-        summary_message = f"\nSummary of conversation earlier: {summary}" if summary else ""
+    summary = state.get("summary", "")
+    summary_message = f"\nSummary of conversation earlier: {summary}" if summary else ""
 
+    # For Gemini, convert system message to a human message with the context
+    if "gemini" in str(model).lower():
+        system_content = prompt + mems_message + summary_message
+        messages = [HumanMessage(content=f"Context: {system_content}")] + state["messages"]
+    else:
         messages = [SystemMessage(
             content=(prompt + mems_message + summary_message)
         )] + state["messages"]
 
-        LOGGER.debug("Model call messages: %s", messages)
-        LOGGER.debug("Model call messages length: %s", len(messages))
+    LOGGER.debug("Model call messages: %s", messages)
+    LOGGER.debug("Model call messages length: %s", len(messages))
 
-        response = await model.ainvoke(messages)
-        return {"messages": response}
-        
-    except Exception as e:
-        if "quota" in str(e).lower():
-            LOGGER.warning("Quota limit reached, retrying after delay: %s", str(e))
-            raise  # This will trigger the retry
-        raise  # Re-raise other exceptions
+    response = await model.ainvoke(messages)
+    return {"messages": response}
 
-@retry(
-    wait=wait_exponential(multiplier=1, min=4, max=60),
-    stop=stop_after_attempt(3)
-)
 async def _summarize_and_trim(
         state: State, config: RunnableConfig, *, store: BaseStore
     ) -> dict[str, list[AnyMessage]]:
@@ -181,14 +160,7 @@ async def _summarize_and_trim(
     )
 
     LOGGER.debug("Summary messages: %s", messages)
-    try:
-        await asyncio.sleep(random.uniform(0.5, 2))
-        response = await model_with_config.ainvoke(messages)
-    except Exception as e:
-        if "quota" in str(e).lower():
-            LOGGER.warning("Quota limit reached, retrying after delay: %s", str(e))
-            raise
-        raise
+    response = await model_with_config.ainvoke(messages)
 
     # Trim message history to manage context window length.
     trimmed_messages = trim_messages(
@@ -236,6 +208,7 @@ async def _call_tools(
         if tool_name in langchain_tools:
             lc_tool = langchain_tools[tool_name.lower()]
 
+            # Provide hidden args to tool at runtime.
             tool_call_copy = copy.deepcopy(tool_call)
             tool_call_copy["args"].update(
                 {
@@ -248,6 +221,7 @@ async def _call_tools(
                 tool_response = await lc_tool.ainvoke(tool_call_copy)
             except (Exception, ValidationError) as e:
                 tool_response = _handle_tool_error(repr(e), tool_name, tool_call["id"])
+        # A Home Assistant tool was called.
         else:
             tool_input = base_data.llm.ToolInput(
                 tool_name=tool_name,
