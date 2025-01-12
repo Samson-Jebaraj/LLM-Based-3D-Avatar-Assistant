@@ -6,11 +6,6 @@ import json
 import logging
 from typing import Literal
 
-import voluptuous as vol
-from homeassistant.exceptions import (
-    HomeAssistantError,
-)
-from homeassistant.helpers import llm
 from langchain_core.messages import (
     AnyMessage,
     BaseMessage,
@@ -41,8 +36,39 @@ from .const import (
     TOOL_CALL_ERROR_TEMPLATE,
     VLM_NUM_PREDICT,
 )
+import asyncio
+from pathlib import Path
+import os
+import sys
+import importlib.util
+from dotenv import load_dotenv
 
 LOGGER = logging.getLogger(__name__)
+
+current_dir = Path(__file__).parent
+project_root = current_dir.parent
+    
+env_path = project_root / "API_KEYS.env"
+if not env_path.exists():
+    raise FileNotFoundError(f"Environment file not found at {env_path}")
+    
+load_dotenv(dotenv_path=str(env_path))
+wolfram_api_key = os.environ.get("WOLFRAM_ALPHA_API_KEY")
+    
+if not wolfram_api_key:
+    raise ValueError("WOLFRAM_ALPHA_API_KEY not found in environment variables")
+base_data_path = project_root / "BASE_DATA.py"
+if not base_data_path.exists():
+    raise FileNotFoundError(f"BASE_DATA.py not found at {base_data_path}")
+    
+sys.path.insert(0, str(project_root))
+    
+try:
+    spec = importlib.util.spec_from_file_location("BASE_DATA", base_data_path)
+    base_data = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(base_data)
+except Exception as e:
+    raise ImportError(f"Failed to import BASE_DATA: {str(e)}")
 
 class State(MessagesState):
     """Extend the MessagesState to include a summary key."""
@@ -57,28 +83,38 @@ async def _call_model(
     prompt = config["configurable"]["prompt"]
     user_id = config["configurable"]["user_id"]
 
-    # Retrieve most recent or search for most relevant memories for context.
-    # Use semantic search if the last message was from the user.
-    msg = state["messages"][-1]
-    query_prompt = EMBEDDING_MODEL_PROMPT_TEMPLATE.format(
-        query=msg.content
-    ) if isinstance(msg, HumanMessage) else None
-    mems = await store.asearch(
-        (user_id, "memories"),
-        query=query_prompt,
-        limit=10
-    )
-    formatted_mems = "\n".join(f"[{mem.key}]: {mem.value}" for mem in mems)
-    mems_message = f"\n<memories>\n{formatted_mems}\n</memories>" \
-        if formatted_mems else ""
+    # Initialize empty memories message
+    mems_message = ""
+    
+    # Only attempt to retrieve memories if store is available
+    if store is not None:
+        try:
+            msg = state["messages"][-1]
+            query_prompt = EMBEDDING_MODEL_PROMPT_TEMPLATE.format(
+                query=msg.content
+            ) if isinstance(msg, HumanMessage) else None
+            
+            mems = await store.asearch(
+                (user_id, "memories"),
+                query=query_prompt,
+                limit=10
+            )
+            formatted_mems = "\n".join(f"[{mem.key}]: {mem.value}" for mem in mems)
+            mems_message = f"\n<memories>\n{formatted_mems}\n</memories>" if formatted_mems else ""
+        except Exception as e:
+            LOGGER.warning("Failed to retrieve memories: %s", str(e))
 
-    # Retrive the latest conversation summary.
     summary = state.get("summary", "")
     summary_message = f"\nSummary of conversation earlier: {summary}" if summary else ""
 
-    messages = [SystemMessage(
-        content=(prompt + mems_message + summary_message)
-    )] + state["messages"]
+    # For Gemini, convert system message to a human message with the context
+    if "gemini" in str(model).lower():
+        system_content = prompt + mems_message + summary_message
+        messages = [HumanMessage(content=f"Context: {system_content}")] + state["messages"]
+    else:
+        messages = [SystemMessage(
+            content=(prompt + mems_message + summary_message)
+        )] + state["messages"]
 
     LOGGER.debug("Model call messages: %s", messages)
     LOGGER.debug("Model call messages length: %s", len(messages))
@@ -183,11 +219,11 @@ async def _call_tools(
 
             try:
                 tool_response = await lc_tool.ainvoke(tool_call_copy)
-            except (HomeAssistantError, ValidationError) as e:
+            except (Exception, ValidationError) as e:
                 tool_response = _handle_tool_error(repr(e), tool_name, tool_call["id"])
         # A Home Assistant tool was called.
         else:
-            tool_input = llm.ToolInput(
+            tool_input = base_data.llm.ToolInput(
                 tool_name=tool_name,
                 tool_args=tool_args,
             )
@@ -200,7 +236,7 @@ async def _call_tools(
                     tool_call_id=tool_call["id"],
                     name=tool_name,
                 )
-            except (HomeAssistantError, vol.Invalid) as e:
+            except Exception as e:
                 tool_response = _handle_tool_error(repr(e), tool_name, tool_call["id"])
 
         LOGGER.debug("Tool response: %s", tool_response)

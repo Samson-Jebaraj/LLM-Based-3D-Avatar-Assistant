@@ -20,7 +20,10 @@ llm = ChatGoogleGenerativeAI(
     model="gemini-pro", 
     google_api_key=google_api_key,
     temperature=0.3,
-    max_retries=3
+    max_retries=2,
+    max_output_tokens=2048,  # Limit output size
+    # Add request timeout
+    request_timeout=30.0
 )
 
 def log_conversation(message, response):
